@@ -30,6 +30,7 @@ RuntimeName = Literal[
     "gemini-flash-deep",
     "gemini-flash-react",
     "claude-sonnet-4-6-react",
+    "claude-haiku-4-5-react",
     "noop",
 ]
 
@@ -38,6 +39,7 @@ _VALID_RUNTIMES = (
     "gemini-flash-deep",
     "gemini-flash-react",
     "claude-sonnet-4-6-react",
+    "claude-haiku-4-5-react",
     "noop",
 )
 
@@ -90,7 +92,9 @@ def build_graph(
     if runtime == "gemini-flash-react":
         return _build_gemini_react(tools, system_prompt, middleware)
     if runtime == "claude-sonnet-4-6-react":
-        return _build_claude_react(tools, system_prompt, middleware)
+        return _build_claude_react(tools, system_prompt, middleware, model="claude-sonnet-4-6")
+    if runtime == "claude-haiku-4-5-react":
+        return _build_claude_react(tools, system_prompt, middleware, model="claude-haiku-4-5-20251001")
 
     # Unreachable (validated above) — placate type-checker
     raise RuntimeError(f"unreachable runtime branch: {runtime!r}")
@@ -206,14 +210,54 @@ def _build_gemini_react(
 
 # --------------------------------------------------------------------- claude
 
-def _build_claude_react(
-    tools: list, system_prompt: str, middleware: list
-) -> CompiledStateGraph:
-    """Claude Sonnet 4.6 (latest) on the same react factory."""
-    # Lazy import so a missing langchain-anthropic install only surfaces
-    # when this runtime is actually selected.
-    from langchain.agents import create_agent
+
+def _make_claude_llm(model: str, api_key: str):
+    """Return a ChatAnthropic instance that collapses non-consecutive system
+    messages before every API call.
+
+    CopilotKit injects canvas state as SystemMessages mid-conversation.
+    Gemini tolerates them; Claude's API raises
+    'Received multiple non-consecutive system messages'.
+    The fix: merge all SystemMessages into the first one so Claude only
+    ever sees a single system block at position 0.
+    """
     from langchain_anthropic import ChatAnthropic
+    from langchain_core.messages import SystemMessage
+
+    def _collapse_system(messages: list) -> list:
+        systems = [m for m in messages if isinstance(m, SystemMessage)]
+        others = [m for m in messages if not isinstance(m, SystemMessage)]
+        if len(systems) <= 1:
+            return messages
+        merged = "\n\n".join(
+            m.content if isinstance(m.content, str)
+            else " ".join(b.get("text", "") for b in m.content if isinstance(b, dict))
+            for m in systems
+        )
+        return [SystemMessage(content=merged)] + others
+
+    class _FixedAnthropic(ChatAnthropic):
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            return super()._generate(_collapse_system(messages), stop=stop, run_manager=run_manager, **kwargs)
+
+        def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+            yield from super()._stream(_collapse_system(messages), stop=stop, run_manager=run_manager, **kwargs)
+
+        async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+            return await super()._agenerate(_collapse_system(messages), stop=stop, run_manager=run_manager, **kwargs)
+
+        async def _astream(self, messages, stop=None, run_manager=None, **kwargs):
+            async for chunk in super()._astream(_collapse_system(messages), stop=stop, run_manager=run_manager, **kwargs):
+                yield chunk
+
+    return _FixedAnthropic(model=model, temperature=0, api_key=api_key or "stub")
+
+
+def _build_claude_react(
+    tools: list, system_prompt: str, middleware: list, *, model: str = "claude-sonnet-4-6"
+) -> CompiledStateGraph:
+    """Claude react agent. Supports Sonnet 4.6 and Haiku 4.5 via `model` arg."""
+    from langchain.agents import create_agent
 
     api_key = os.getenv("ANTHROPIC_API_KEY") or ""
     if not api_key:
@@ -224,12 +268,7 @@ def _build_claude_react(
             flush=True,
         )
 
-    # Sonnet 4.6 is the latest Sonnet 4 minor — DO NOT downgrade to 3.5.
-    llm = ChatAnthropic(
-        model="claude-sonnet-4-6",
-        temperature=0,
-        api_key=api_key or "stub",
-    )
+    llm = _make_claude_llm(model, api_key)
     return create_agent(
         model=llm,
         tools=tools,

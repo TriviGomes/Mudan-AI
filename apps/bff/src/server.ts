@@ -25,6 +25,8 @@ const agent = new LangGraphAgent({
   },
 });
 
+const mcpServerUrl = process.env.MCP_SERVER_URL?.trim();
+
 const app = createCopilotEndpoint({
   basePath: "/api/copilotkit",
   runtime: new CopilotRuntime({
@@ -34,15 +36,19 @@ const app = createCopilotEndpoint({
     agents: { default: agent },
     openGenerativeUI: true,
     a2ui: { injectA2UITool: false },
-    mcpApps: {
-      servers: [
-        {
-          type: "http",
-          url: process.env.MCP_SERVER_URL || "http://localhost:3001/mcp",
-          serverId: "manufact_local",
-        },
-      ],
-    },
+    ...(mcpServerUrl
+      ? {
+          mcpApps: {
+            servers: [
+              {
+                type: "http" as const,
+                url: mcpServerUrl,
+                serverId: "manufact_local",
+              },
+            ],
+          },
+        }
+      : {}),
   }),
 });
 
